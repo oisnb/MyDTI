@@ -9,8 +9,8 @@ from metrics import *
 
 dataset = 'davis'
 fold = 0
-TRAIN_BATCH_SIZE = 20
-TEST_BATCH_SIZE = 20
+TRAIN_BATCH_SIZE = 16
+TEST_BATCH_SIZE = 16
 NUM_EPOCHS = 20
 
 protein_dim = 100

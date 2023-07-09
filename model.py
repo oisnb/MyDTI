@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import math
 import numpy as np
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, precision_recall_curve, auc
 from submodel import *
@@ -86,21 +85,21 @@ class Encoder(nn.Module): #编码层 处理蛋白质
         self.emb4 = nn.Embedding(100 + 1, 200)
         self.lin_vc = nn.Linear(100, 200)
 
-    def forward(self, data_pro_seq, data_pro, data_pro_pcm, data_pro_vc, device): #处理蛋白质 还要拼接为一个矩阵
+    def forward(self, data_pro_seq, data_pro, max_num, data_pro_pcm, data_pro_vc, device): #处理蛋白质 还要拼接为一个矩阵
         #pos = torch.arange(0, protein.shape[1]).unsqueeze(0).repeat(protein.shape[0], 1).to(self.device)
         #protein = protein + self.pos_embedding(pos)
         #protein = [batch size, protein len,protein_dim]
 
         #pro_cnn 确保每个都是三维
-        pro_cnn = self.PCNN(data_pro_seq) #[8,32,200]
+        pro_cnn = self.PCNN(data_pro_seq) #[20,32,200]
         #pro_cnn = self.emb1(pro_cnn)
-        pcm_cnn = self.PCM_CNN(data_pro_pcm) #[8,128,200]
+        pcm_cnn = self.PCM_CNN(data_pro_pcm) #[20,128,200]
         #pcm_cnn = self.emb2(pcm_cnn)
-        pro_gnn = self.PGNN(data_pro) #[8,216,200]
+        pro_gnn = self.PGNN(data_pro, max_num) #[20,1634,200]
         #pro_gnn = self.emb3(pro_gnn)
         #data_pro_vc 可以直接用 已经是三维的
         #data_pro_vc =self.emb4(data_pro_vc)
-        data_pro_vc = self.lin_vc(data_pro_vc)
+        data_pro_vc = self.lin_vc(data_pro_vc) #[20,20,200]
         #合并四个量？ 先用embedding缩到一个num_feats上
         src = torch.cat((pro_cnn, pcm_cnn), dim=1)
         src = torch.cat((src, pro_gnn), dim=1)
@@ -223,21 +222,12 @@ class Predictor(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.DCNN = DCNN(device)
-        self.DGNN = DGNN()
+        self.DGNN = DGNN(device)
         self.device = device
-        self.weight_1 = nn.Parameter(torch.FloatTensor(atom_dim, atom_dim))
-        self.weight_2 = nn.Parameter(torch.FloatTensor(atom_dim, atom_dim))
-        self.init_weight()
         self.emb1 = nn.Embedding(64 + 1, 200)
         self.emb2 = nn.Embedding(20 + 1, 200)
         self.emb3 = nn.Embedding(1024 + 1, 200)
         self.mol_fp = torch.nn.Linear(1024, 200)
-
-    def init_weight(self):
-        stdv = 1. / math.sqrt(self.weight_1.size(1))
-        self.weight_1.data.uniform_(-stdv, stdv)
-        self.weight_2.data.uniform_(-stdv, stdv)
-
 
     def make_masks(self, atom_num, protein_num, compound_max_len, protein_max_len):
         N = len(atom_num)  # batch size
@@ -250,48 +240,68 @@ class Predictor(nn.Module):
         protein_mask = protein_mask.unsqueeze(1).unsqueeze(2).to(self.device)
         return compound_mask, protein_mask
 
+    def pack(self, atoms, proteins, device): #蛋白质大小 54
+        atoms_len = 0
+        proteins_len = 0
+        N = len(atoms)
+        atom_num = []
+        for i in range(N):
+            atom_num.append(atoms[i].x.shape[0])
+            if atoms[i].x.shape[0] >= atoms_len:
+                atoms_len = atoms[i].x.shape[0]
+
+        protein_num = []
+        for i in range(N):
+            protein_num.append(proteins[i].x.shape[0])
+            if proteins[i].x.shape[0] >= proteins_len:
+                proteins_len = proteins[i].x.shape[0]
+
+        atoms_new = torch.zeros((N, atoms_len, 78), device=device)
+        for i in range(N):
+            a_len = atoms[i].x.shape[0]
+            atoms_new[i, :a_len, :] = atoms[i].x
+
+        proteins_new = torch.zeros((N, proteins_len, 54), device=device)
+        for i in range(N):
+            a_len = proteins[i].x.shape[0]
+            proteins_new[i, :a_len, :] = proteins[i].x
+
+        adjs_new = torch.zeros((N, atoms_len, atoms_len), device=device)
+        for i in range(N):
+            adj = torch.zeros(atoms_len, atoms_len)
+            adj[atoms[i].edge_index[0], atoms[i].edge_index[1]] = 1
+            adjs_new[i, :atoms_len, :atoms_len] = adj
+
+        adjs_pro = torch.zeros((N, proteins_len, proteins_len), device=device)
+        for i in range(N):
+            adj = torch.zeros(proteins_len, proteins_len)
+            adj[proteins[i].edge_index[0], proteins[i].edge_index[1]] = 1
+            adjs_pro[i, :proteins_len, :proteins_len] = adj
+
+        return (atoms_new, adjs_new, proteins_new, adjs_pro, atom_num, protein_num)  # atom_num就是每个药物拥有的原子个数 在MyDTI里把药物
 
     def forward(self, data_mol_seq, data_mol, data_mol_fp, data_pro_seq, data_pro_pcm, data_pro, data_pro_vc):
-        data_pro_pcm = data_pro_pcm.squeeze(1) #删除一维
-        # data_mol_seq = [batch, seq_length]
-        # data_mol = [batch]
-        # data_mol_fp = [batch,fp_length]
-        # data_pro_seq = [batch,protein len]
-        # data_pro_pcm = [batch,channel,length,width]
-        # data_pro_vc = [batch,len,dim] len=20 dim=100
-        ####计算mask矩阵
-        #计算atom_num
-        atom_num = []
-        atoms_len = 0
-        for i in range(len(data_mol)):
-            atom_num.append(data_mol[i]['x'].shape[0])
-            if data_mol[i]['x'].shape[0] >= atoms_len:
-                atoms_len = data_mol[i]['x'].shape[0]
-        #计算pro_num 方便计算mask矩阵
-        protein_num = []
-        proteins_len = 0
-        for i in range(len(data_pro)):
-            protein_num.append(data_pro[i]['x'].shape[0])
-            if data_pro[i]['x'].shape[0] >= proteins_len:
-                proteins_len = data_pro[i]['x'].shape[0]
+        data_pro_pcm = data_pro_pcm.squeeze(1) #删除一维 每一种输入的形式 有
 
+#########在这里pack？ 模仿 通过list增加
+        compound, adjs_d, protein, adjs_p, atom_num, protein_num = self.pack(data_mol, data_pro, self.device)
         ####药物处理 记录大小
-        drug_cnn = self.DCNN(data_mol_seq).to(torch.long) #已经是三维
+        drug_cnn = self.DCNN(data_mol_seq).to(torch.long) #已经是三维 [20,128,200]
      #   drug_cnn = self.emb1(drug_cnn)
-        drug_gnn = self.DGNN(data_mol) #调整为三维
+        drug_gnn = self.DGNN(data_mol, max(atom_num)) #调整为三维 [20,44,200]
      #   drug_gnn = self.emb2(drug_gnn)
         #data_mol_fp是分子指纹 可以直接拿来用 分子指纹调整为[batch,1,num_feats]
-        data_mol_fp = data_mol_fp.reshape(data_mol_fp.shape[0], 1, data_mol_fp.shape[1]) #[8,1,1024]
+        data_mol_fp = data_mol_fp.reshape(data_mol_fp.shape[0], 1, data_mol_fp.shape[1]) #[20,1,1024]
         data_mol_fp = data_mol_fp.float()
-        data_mol_fp = self.mol_fp(data_mol_fp) #[8,1,200]
+        data_mol_fp = self.mol_fp(data_mol_fp) #[20,1,200]
 
         #根据第二维进行拼接 先embedding
         enc_trg = torch.cat((drug_cnn, drug_gnn), dim=1)
-        enc_trg = torch.cat((enc_trg, data_mol_fp), dim=1) #[8,159,200]
+        enc_trg = torch.cat((enc_trg, data_mol_fp), dim=1) #[20,173,200]
 
 
         ####蛋白质处理 在encode里面进行 encode里面要拼接成一个三维数组  cnn的不需要pooling gnn的要多加一维 vc直接用
-        enc_src = self.encoder(data_pro_seq, data_pro, data_pro_pcm, data_pro_vc, self.device) #[8,396,200]
+        enc_src = self.encoder(data_pro_seq, data_pro, max(protein_num), data_pro_pcm, data_pro_vc, self.device) #[20,1814,200]
 
         compound_mask, protein_mask = self.make_masks(atom_num, protein_num, enc_trg.shape[1], enc_src.shape[1])
 
@@ -299,3 +309,4 @@ class Predictor(nn.Module):
         out = self.decoder(enc_trg, enc_src, compound_mask, protein_mask)
         ####return 这个值 丢到外面去算损失5
         return out
+

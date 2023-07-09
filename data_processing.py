@@ -243,6 +243,15 @@ def data_to_csv(csv_file, datalist):
         for data in datalist:
             f.write(','.join(map(str, data)) + '\n')
 
+def data_to_pickle(file_name, datalist):
+    with open(file_name, 'wb') as f:
+        pickle.dump(datalist, f)
+
+def pickle_to_data(file_name):
+    with open(file_name, 'rb') as f:
+        loaded_dict = pickle.load(f)
+    return loaded_dict
+
 
 def create_dataset_for_test(dataset):
     # load dataset
@@ -301,6 +310,7 @@ def create_dataset_for_test(dataset):
     target_key = prot_keys
 
     # create smile graph
+
     smile_graph = {}
     for smile in compound_iso_smiles:
         g = smile_to_graph(smile)
@@ -381,6 +391,9 @@ def create_dataset_for_5folds(dataset, fold=0):
     valid_valid_count = 0
     for opt in opts:
         if opt == 'train': #考虑如何把数据对应起来 通过将结合力矩阵展平+顺序查找 找到药物smiles对应的蛋白质及其结合力大小
+            csv_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + opt + '.csv'
+            # if os.path.exists(csv_file):
+            #     continue
             rows, cols = np.where(np.isnan(affinity) == False)
             rows, cols = rows[train_folds], cols[train_folds]
             train_fold_entries = []
@@ -395,9 +408,11 @@ def create_dataset_for_5folds(dataset, fold=0):
                 train_fold_entries.append(ls) #list集合 一个list包括一个药物smiles 蛋白质序列 蛋白质key 药物和蛋白质的结合力
                 valid_train_count += 1
 
-            csv_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + opt + '.csv'
             data_to_csv(csv_file, train_fold_entries) #存储所有数据
         elif opt == 'valid':
+            csv_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + opt + '.csv'
+            # if os.path.exists(csv_file):
+            #     continue
             rows, cols = np.where(np.isnan(affinity) == False) #行代表药物位置 列代表蛋白质位置 把二维矩阵拉平 一个个点进行判断
             rows, cols = rows[valid_fold], cols[valid_fold] #valid_fold就是对应点的位置 每个样本都是点
             valid_fold_entries = []
@@ -412,7 +427,6 @@ def create_dataset_for_5folds(dataset, fold=0):
                 valid_fold_entries.append(ls)
                 valid_valid_count += 1
 
-            csv_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + opt + '.csv'
             data_to_csv(csv_file, valid_fold_entries)
     print('dataset:', dataset)
     # print('len(set(drugs)),len(set(prots)):', len(set(drugs)), len(set(prots)))
@@ -426,22 +440,35 @@ def create_dataset_for_5folds(dataset, fold=0):
     target_key = prot_keys
 
     # create smile graph 对所有smiles构建唯一的图表示 图的特征包括点的数量 点的全部特征 所有边的起点和终点
-    smile_graph = {}
-    for smile in compound_iso_smiles:
-        g = smile_to_graph(smile) #把smiles序列转换成图的相关信息 点 边 构成一个元组
-        smile_graph[smile] = g #把smiles和自身对应的图联系起来
+    smile_graph_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + 'smile_graph' + '.pickle'
+    if os.path.exists(smile_graph_file):
+        smile_graph = pickle_to_data(smile_graph_file)
+    else:
+        smile_graph = {}
+        for smile in compound_iso_smiles:
+            g = smile_to_graph(smile) #把smiles序列转换成图的相关信息 点 边 构成一个元组
+            smile_graph[smile] = g #把smiles和自身对应的图联系起来
+        data_to_pickle(smile_graph_file, smile_graph)
     # print(smile_graph['CN1CCN(C(=O)c2cc3cc(Cl)ccc3[nH]2)CC1']) #for test
 
     # create target graph 和smiles一个道理
     # print('target_key', len(target_key), len(set(target_key)))
-    target_graph = {}
-    for key in target_key:
-        if not valid_target(key, dataset):  # ensure the contact and aln files exists
-            continue
-        g = target_to_graph(key, proteins[key], contac_path, msa_path) #返回元组 第一个是蛋白质拥有的氨基酸数目 第二个是蛋白质的全部特征 包括pssm矩阵 氨基酸热编码等 第三个是哪些基团有接触
-        target_graph[key] = g
-        pcm =protein_to_matrix(key, contac_path)
-        pro_contect[key] = pcm
+    target_graph_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + 'target_graph' + '.pickle'
+    pcm_file = 'data/' + dataset + '_' + 'fold_' + str(fold) + '_' + 'pcm' + '.pickle'
+    if os.path.exists(target_graph_file) and os.path.exists(pcm_file):
+        target_graph = pickle_to_data(target_graph_file)
+        pro_contect = pickle_to_data(pcm_file)
+    else:
+        target_graph = {}
+        for key in target_key:
+            if not valid_target(key, dataset):  # ensure the contact and aln files exists
+                continue
+            g = target_to_graph(key, proteins[key], contac_path, msa_path) #返回元组 第一个是蛋白质拥有的氨基酸数目 第二个是蛋白质的全部特征 包括pssm矩阵 氨基酸热编码等 第三个是哪些基团有接触
+            target_graph[key] = g
+            pcm = protein_to_matrix(key, contac_path)
+            pro_contect[key] = pcm
+        data_to_pickle(target_graph_file, target_graph)
+        data_to_pickle(pcm_file, pro_contect)
 
     # count the number of  proteins with aln and contact files
     print('effective drugs,effective prot:', len(smile_graph), len(target_graph))

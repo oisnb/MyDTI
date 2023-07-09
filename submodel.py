@@ -7,9 +7,12 @@ from rdkit.Chem import AllChem
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from typing import Dict, Iterator, List, Optional, Union, Tuple
 from torch_geometric.nn import GCNConv, GATConv, global_max_pool as gmp, global_add_pool as gap,global_mean_pool as gep,global_sort_pool
-from torch_geometric.utils import dropout_adj
+from torch_geometric.utils import dropout_adj, to_dense_batch
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 
 kernel_size = 7
@@ -59,60 +62,32 @@ class DCNN(nn.Module):
         return conved #返回三维的tensor
 
 class DGNN(torch.nn.Module):
-    def __init__(self, n_output=1, num_features_mol=78, output_dim=128, dropout=0.2):
+    def __init__(self, device, num_features_mol=78, output_dim=200, dropout=0.2):
         super(DGNN, self).__init__()
 
-        self.n_output = n_output
+        self.device = device
         self.mol_conv1 = GCNConv(num_features_mol, num_features_mol)
         self.mol_conv2 = GCNConv(num_features_mol, num_features_mol * 2)
         self.mol_conv3 = GCNConv(num_features_mol * 2, num_features_mol * 4)
-        self.mol_fc_g1 = torch.nn.Linear(num_features_mol * 4, 30) #都归约到只有30个原子
-        self.embed_xt = nn.Embedding(30, 200)  # 加一维200
-        self.mol_fc_g2 = torch.nn.Linear(1024, output_dim)
-
+        self.mol_fc = torch.nn.Linear(num_features_mol * 4, output_dim)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-    def pack(self, data_mol, num_features_mol): #没用上
-        atom_num = []
-        atoms_len = 0
-        for i in range(len(data_mol)):
-            atom_num.append(data_mol[i].num_nodes)
-            if data_mol[i].num_nodes >= atoms_len:
-                atoms_len = data_mol[i].num_nodes
-        if num_features_mol % atoms_len == 0:
-            return atoms_len
-        else:
-            while num_features_mol % atoms_len != 0:
-                atoms_len-=1
-            return atoms_len
-
-    def forward(self, data_mol, num_features_mol=78):
+    def forward(self, data_mol, max_num):
         # get graph input
-        mol_x, mol_edge_index, mol_batch = data_mol.x, data_mol.edge_index, data_mol.batch
-
-        #######药物分子处理
-        x = self.mol_conv1(mol_x, mol_edge_index)
+        mol_x, mol_edge_index, mol_batch = data_mol.x, data_mol.edge_index, data_mol.batch  # [604.78]
+        x = self.mol_conv1(mol_x, mol_edge_index)  # [635,78] 第一个数字是全部原子数相加？
         x = self.relu(x)
 
         # mol_edge_index, _ = dropout_adj(mol_edge_index, training=self.training)
-        x = self.mol_conv2(x, mol_edge_index)
+        x = self.mol_conv2(x, mol_edge_index)  # [635,156]
         x = self.relu(x)
 
         # mol_edge_index, _ = dropout_adj(mol_edge_index, training=self.training)
-        x = self.mol_conv3(x, mol_edge_index)
+        x = self.mol_conv3(x, mol_edge_index)  # [635,312]
         x = self.relu(x)
-        x = gep(x, mol_batch)  # global pooling [512,312]
-
-        x = self.relu(self.mol_fc_g1(x))
-        x = self.dropout(x)
-        x = x.long()
-        x = self.embed_xt(x)
-        # len = self.pack(data_mol, num_features_mol*8)
-        #
-        # x = x.reshape(x.shape[0], len, -1)
-        #
-        # x = self.dropout(self.mol_fc_g2(x))
+        x = self.mol_fc(x)
+        x, _ = to_dense_batch(x, mol_batch, max_num) #[20,40,312]
         return x #返回三维的数组
 
 class PCNN(torch.nn.Module):
@@ -189,7 +164,7 @@ class PCM_CNN(nn.Module):
         return x
 
 class PGNN(torch.nn.Module):
-    def __init__(self, device, num_features_pro=54, output_dim=128, dropout=0.2):
+    def __init__(self, device, num_features_pro=54, output_dim=200, dropout=0.2):
         super(PGNN, self).__init__()
 
         self.device = device
@@ -198,30 +173,14 @@ class PGNN(torch.nn.Module):
         self.pro_conv2 = GCNConv(num_features_pro, num_features_pro * 2)
         self.pro_conv3 = GCNConv(num_features_pro * 2, num_features_pro * 4)
         # self.pro_conv4 = GCNConv(embed_dim * 4, embed_dim * 8)
-        self.pro_fc_g1 = torch.nn.Linear(num_features_pro * 4, 1024)
-        self.pro_fc_g2 = torch.nn.Linear(1024, output_dim)
-        self.embed_xt = nn.Embedding(num_features_pro * 4, 200)
+        self.pro_fc_g1 = torch.nn.Linear(num_features_pro * 4, output_dim)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-    def pack(self, data_pro, xt, device): #没用上
-        atom_num = []
-        atoms_len = 0
-        for i in range(len(data_pro)):
-            atom_num.append(data_pro[i].num_nodes)
-            if data_pro[i].num_nodes >= atoms_len:
-                atoms_len = data_pro[i].num_nodes
-        proteins_new = torch.zeros((len(data_pro), atoms_len, 100), device=device)
-        for i in range(len(data_pro)):
-            a_len = xt[i].shape[1]
-            proteins_new[i, :a_len, :] = xt[i]
 
-
-    def forward(self, data_pro, num_features_pro=54):
+    def forward(self, data_pro, max_num):
         # get protein input
         target_x, target_edge_index, target_batch = data_pro.x, data_pro.edge_index, data_pro.batch
-
-        #####蛋白质处理
         xt = self.pro_conv1(target_x, target_edge_index)
         xt = self.relu(xt)
 
@@ -232,20 +191,7 @@ class PGNN(torch.nn.Module):
         # target_edge_index, _ = dropout_adj(target_edge_index, training=self.training)
         xt = self.pro_conv3(xt, target_edge_index)
         xt = self.relu(xt)
+        xt = self.pro_fc_g1(xt)
+        xt, _ = to_dense_batch(xt, target_batch, max_num) #[20,40,312]
 
-        # xt = self.pro_conv4(xt, target_edge_index)
-        # xt = self.relu(xt)
-        xt = gep(xt, target_batch)  # global pooling 大小？ 换个方式 蛋白质原子太多了 [8,216]
-
-        #xt = self.pack(data_pro, xt, self.device)
-
-        #xt = xt.reshape(xt.shape[0], len, -1) #试试 不行就展开然后加多一维1
-        # flatten
-        # xt = self.relu(self.pro_fc_g1(xt))
-        # xt = self.dropout(xt)
-        # xt = self.pro_fc_g2(xt)
-        # xt = self.dropout(xt)
-        # xt = xt.reshape(xt.shape[0], 1, xt.shape[1])
-        xt = xt.long()
-        xt = self.embed_xt(xt)
         return xt #[8,216,200]
